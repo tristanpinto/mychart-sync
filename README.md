@@ -1,6 +1,6 @@
 # MyChart Sync
 
-Download your MyChart records as Markdown and JSON files, with optional Tidepool imports. Let an AI agent analyze them, or use them however you like. The files stay on your computer unless you choose to share them.
+Download your MyChart records as Markdown and JSON files, with optional Tidepool imports. Let an AI agent analyze them, or use them however you like.
 
 ## Start here
 
