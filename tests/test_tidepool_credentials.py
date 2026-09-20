@@ -3,7 +3,9 @@ from __future__ import annotations
 """Tests for auth/tidepool_credentials.py."""
 
 import os
+import json
 import stat
+import traceback
 from pathlib import Path
 
 import pytest
@@ -46,7 +48,7 @@ def test_save_and_load_roundtrip(secrets_dir: Path) -> None:
 def test_load_missing_file_raises_clear_error(secrets_dir: Path) -> None:
     with pytest.raises(TidepoolCredentialsError) as excinfo:
         load_credentials("person_b", secrets_dir)
-    assert "Run: chartstash auth tidepool" in str(excinfo.value)
+    assert "Run: mychart-sync auth tidepool" in str(excinfo.value)
 
 
 def test_load_malformed_file_raises(secrets_dir: Path) -> None:
@@ -55,6 +57,19 @@ def test_load_malformed_file_raises(secrets_dir: Path) -> None:
     path.write_text("not valid json {")
     with pytest.raises(TidepoolCredentialsError):
         load_credentials("person_b", secrets_dir)
+
+
+@pytest.mark.parametrize("data", [{"password": "private-test-password"}, ["private-test-password"]])
+def test_invalid_schema_does_not_expose_credentials(secrets_dir: Path, data) -> None:
+    path = secrets_dir / "tokens" / "person_b" / "tidepool_credentials.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(data))
+
+    with pytest.raises(TidepoolCredentialsError) as caught:
+        load_credentials("person_b", secrets_dir)
+
+    assert "Invalid Tidepool credentials" in str(caught.value)
+    assert "private-test-password" not in "".join(traceback.format_exception(caught.value))
 
 
 def test_delete_returns_true_when_file_existed(secrets_dir: Path) -> None:

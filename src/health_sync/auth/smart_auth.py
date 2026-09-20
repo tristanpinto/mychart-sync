@@ -273,25 +273,10 @@ def authenticate(
     secrets_dir: Path | None = None,
     client_secret: str | None = None,
 ) -> AuthResult:
-    """Run the full SMART on FHIR standalone patient launch flow.
+    """Open MyChart login, capture the local callback, and exchange the code.
 
-    Opens the user's browser for MyChart login, captures the callback,
-    and exchanges the authorization code for tokens.
-
-    Args:
-        fhir_base_url: The FHIR R4 base URL for the health system.
-        client_id: Epic App Orchard client ID.
-        redirect_uri: OAuth2 redirect URI (must match registration).
-        port: Local port for the callback server.
-        timeout: Seconds to wait for user to complete login.
-        client_secret: If provided, uses confidential client flow
-            (Basic auth header) for token exchange. Enables refresh tokens.
-
-    Returns:
-        AuthResult with tokens and patient ID.
-
-    Raises:
-        RuntimeError: If authentication fails or times out.
+    redirect_uri must match the Epic registration. A client_secret uses Basic
+    auth for the confidential-client flow. Failures/timeouts raise RuntimeError.
     """
     # 1. Discover endpoints
     endpoints = discover_endpoints(fhir_base_url)

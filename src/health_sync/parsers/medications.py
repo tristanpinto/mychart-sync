@@ -31,7 +31,7 @@ def _clean_sig(sig: str) -> str:
     return sig
 
 
-def _condense_hospital_details(sig: str, dose: str, route: str) -> str:
+def _condense_hospital_details(sig: str, dose: str) -> str:
     """Condense a hospital medication's sig into a compact Details field.
 
     Produces something like: "2 g, EVERY 8 HOURS, For 2 doses"
@@ -80,25 +80,9 @@ def parse_medications(
     resources: list[dict[str, Any]],
     encounters: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], dict[str, list[dict[str, str]]]]:
-    """Parse MedicationRequest resources into output Medications format.
+    """Return active orders, ended outpatient orders, and hospital orders by stay.
 
-    Active medications format:
-        | Medication | Sig | Route | Dose | Started | Prescriber |
-
-    Ended medications format:
-        | Medication | Sig | Route | Dose | Started | End Date | Status | Prescriber |
-
-    Hospital administered format (per stay):
-        | Medication | Route | Details |
-
-    Args:
-        resources: List of FHIR MedicationRequest resources.
-        encounters: Optional list of FHIR Encounter resources for date range lookup.
-
-    Returns:
-        (active_rows, ended_outpatient_rows, hospital_by_stay) where
-        hospital_by_stay maps "M/D/YYYY - M/D/YYYY" date range strings
-        to lists of hospital med rows.
+    Encounters provide date ranges for grouping hospital orders.
     """
     # Build encounter lookup: ID -> date range string
     enc_dates: dict[str, str] = {}
@@ -121,8 +105,6 @@ def parse_medications(
         for e in encounters:
             if e.get("resourceType") != "Encounter":
                 continue
-            enc_class = e.get("class", {}).get("code", "")
-            # Class codes for inpatient: IMP, or numeric codes used by Epic
             period = e.get("period", {})
             start = period.get("start", "")[:10]
             end = period.get("end", "")[:10]
@@ -201,7 +183,7 @@ def parse_medications(
 
         # Route hospital meds to per-stay lists
         if is_hospital and status != "active":
-            details = _condense_hospital_details(sig, dose, route)
+            details = _condense_hospital_details(sig, dose)
             # Determine which stay this belongs to
             enc_id = r.get("encounter", {}).get("identifier", {}).get("value", "")
             authored_date = r.get("authoredOn", "")[:10]
@@ -254,5 +236,3 @@ def parse_medications(
 ACTIVE_COLUMNS = ["Medication", "Sig", "Route", "Dose", "Started", "Prescriber"]
 ENDED_COLUMNS = ["Medication", "Sig", "Route", "Dose", "Started", "End Date", "Status", "Prescriber"]
 HOSPITAL_COLUMNS = ["Medication", "Route", "Details"]
-KEY_COLS = ["Medication", "Started"]
-HOSPITAL_KEY_COLS = ["Medication", "Route"]

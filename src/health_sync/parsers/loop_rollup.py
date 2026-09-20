@@ -259,7 +259,7 @@ def _compute_cv(values: list[float], mean: float) -> float:
     """Coefficient of variation (%): std / mean × 100.
 
     Note: not time-weighted. For Dexcom 5-min cadence with negligible gaps,
-    this is a good approximation. Phase 3 may add time-weighted CV.
+    this is an approximation rather than a time-weighted CV.
     """
     if not values or mean == 0:
         return 0.0

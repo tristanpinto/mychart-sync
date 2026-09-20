@@ -26,7 +26,7 @@ def test_batch_scopes_every_provider_and_reports_failures(tmp_path, flags, fail_
     result = subprocess.run(["bash", str(script), "me", *providers, "--", *flags], capture_output=True, text=True)
     assert result.returncode == (1 if fail_provider else 0)
     assert (tmp_path / "calls.txt").read_text().splitlines() == [
-        " ".join(["-m", "health_sync.cli", "sync", "--provider", p, "--person", "me", "--override-patient", *flags])
+        " ".join(["-m", "health_sync.cli", "sync", "--provider", p, "--person", "me", *flags])
         for p in providers
     ]
     if fail_provider:

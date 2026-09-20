@@ -2,11 +2,13 @@ from __future__ import annotations
 
 """Download and save clinical document content from FHIR DocumentReferences.
 
-Fetches the actual HTML/text content via Binary.Read and saves to the
-configured records directory. Deduplicates by checking if a file already
-exists at the target path.
+Saves readable text and original PDF bytes under stable, provider-specific
+filenames. Existing records are never overwritten.
 """
 
+import base64
+import hashlib
+import json
 import logging
 import re
 from html.parser import HTMLParser
@@ -19,6 +21,10 @@ from health_sync.parsers.documents import parse_document_references
 from health_sync.parsers.observations import _is_narrative_lab_report
 
 logger = logging.getLogger(__name__)
+
+
+class DocumentDownloadError(RuntimeError):
+    """One or more documents could not be saved; retry before advancing sync state."""
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -73,9 +79,67 @@ def _html_to_text(html: str) -> str:
 def _slugify(text: str) -> str:
     """Convert text to a filename-safe slug."""
     s = text.lower().strip()
-    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"[^a-z0-9\s_-]", "", s)
     s = re.sub(r"[\s-]+", "_", s)
     return s[:50]
+
+
+def _document_name(source: str, resource: dict, date: str, title: str) -> str:
+    """Keep readable labels, but use source and resource identity for uniqueness."""
+    identity = resource.get("id") or json.dumps(resource, sort_keys=True)
+    key = json.dumps([source.rstrip("/"), resource.get("resourceType"), identity])
+    suffix = hashlib.sha256(key.encode()).hexdigest()[:16]
+    match = re.match(r"^\d{4}-\d{2}-\d{2}(?:T|$)", date)
+    day = date[:10] if match else "undated"
+    return f"{day}_{_slugify(title) or 'document'}_{suffix}"
+
+
+def _write_new(path: Path, content: bytes) -> bool:
+    """Do not overwrite existing records or leave failed writes looking complete."""
+    try:
+        stream = path.open("xb")
+    except FileExistsError:
+        return False
+    try:
+        with stream:
+            stream.write(content)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def _document_content(content: bytes, content_type: str) -> tuple[str, bytes]:
+    """Unwrap FHIR Binary and retain PDF bytes; reject API errors as documents."""
+    if content.lstrip().startswith((b"{", b"[")):
+        try:
+            resource = json.loads(content)
+        except json.JSONDecodeError:
+            # Clinical text can begin with a bracket without being JSON.
+            if content_type.partition(";")[0].lower() not in {"text/plain", "text/html", "application/xhtml+xml"}:
+                raise
+        else:
+            if not isinstance(resource, dict) or resource.get("resourceType") != "Binary":
+                raise ValueError("Expected a FHIR Binary document")
+            content = base64.b64decode(resource["data"], validate=True)
+            content_type = resource.get("contentType") or content_type
+
+    mime = content_type.partition(";")[0].strip().lower()
+    if content.startswith(b"%PDF-"):
+        return ".pdf", content
+    if mime == "application/pdf":
+        raise ValueError("PDF document has no PDF header")
+    if mime and mime not in ("text/html", "application/xhtml+xml", "text/plain"):
+        raise ValueError("Unsupported document content type")
+
+    text = content.decode("utf-8")
+    if "\x00" in text:
+        raise ValueError("Unexpected binary document")
+    if mime != "text/plain":
+        text = _html_to_text(text)
+    if not text.strip():
+        raise ValueError("Empty document")
+    return ".txt", text.encode("utf-8")
 
 
 def _first_display(concept: dict[str, Any]) -> str:
@@ -90,6 +154,7 @@ def _first_display(concept: dict[str, Any]) -> str:
 def _save_narrative_observation_reports(
     fhir_data: dict[str, list[dict[str, Any]]],
     records_dir: Path,
+    source: str,
 ) -> int:
     """Save report-like Observation.valueString payloads as clinical records."""
     observations = []
@@ -97,15 +162,11 @@ def _save_narrative_observation_reports(
     observations.extend(fhir_data.get("Observation", []))
 
     saved = 0
-    seen_ids = set()
+    seen_names = set()
     for observation in observations:
         if observation.get("resourceType") != "Observation":
             continue
         obs_id = observation.get("id", "")
-        if obs_id in seen_ids:
-            continue
-        seen_ids.add(obs_id)
-
         if not _is_narrative_lab_report(observation):
             continue
 
@@ -119,9 +180,11 @@ def _save_narrative_observation_reports(
             or observation.get("effectivePeriod", {}).get("start")
             or "undated"
         )
-        date_prefix = date.split("T")[0] if "T" in date else date
         report_type = _first_display(observation.get("code", {})) or "clinical_report"
-        base_name = f"{date_prefix}_{_slugify(report_type)}"
+        base_name = _document_name(source, observation, date, report_type)
+        if base_name in seen_names:
+            continue
+        seen_names.add(base_name)
         txt_path = records_dir / f"{base_name}.txt"
         if txt_path.exists():
             continue
@@ -136,9 +199,7 @@ def _save_narrative_observation_reports(
             header.append(f"Status: {observation['status']}")
 
         text = "\n".join(header) + "\n\n" + body.replace("\r\n", "\n").replace("\r", "\n") + "\n"
-        txt_path.write_text(text)
-        logger.info(f"  Saved narrative report: {base_name}.txt ({len(text)} chars)")
-        saved += 1
+        saved += _write_new(txt_path, text.encode("utf-8"))
 
     return saved
 
@@ -148,79 +209,52 @@ def download_documents(
     client: FHIRClient,
     records_dir: Path,
 ) -> int:
-    """Download clinical document content and save to records directory.
-
-    Args:
-        fhir_data: Dict with "DocumentReference" key containing FHIR resources.
-        client: Authenticated FHIRClient for Binary.Read calls.
-        records_dir: Target directory for saved documents.
-
-    Returns:
-        Number of documents downloaded.
-    """
+    """Save new attachments and narrative reports; return the number written."""
     doc_refs = [r for r in fhir_data.get("DocumentReference", [])
                 if r.get("resourceType") == "DocumentReference"]
 
     records_dir.mkdir(parents=True, exist_ok=True)
-    downloaded = _save_narrative_observation_reports(fhir_data, records_dir)
+    source = getattr(client, "base_url", "")
+    try:
+        downloaded = _save_narrative_observation_reports(fhir_data, records_dir, source)
+    except Exception:
+        raise DocumentDownloadError("Could not save narrative reports; retry the sync.") from None
 
     if not doc_refs:
         return downloaded
 
     docs = parse_document_references(doc_refs)
+    failures = 0
 
     for doc in docs:
         if not doc["content_urls"]:
             continue
 
-        # Build filename: date_type.txt
-        date_prefix = doc["date"].split("T")[0] if doc["date"] else "undated"
-        type_slug = _slugify(doc["type"]) if doc["type"] else "document"
-        base_name = f"{date_prefix}_{type_slug}"
+        identity = {"resourceType": "DocumentReference", **doc}
+        base_name = _document_name(source, identity, doc["date"], doc["type"])
 
         # Check if already downloaded
-        txt_path = records_dir / f"{base_name}.txt"
-        if txt_path.exists():
+        if any((records_dir / f"{base_name}{ext}").exists() for ext in (".txt", ".pdf")):
             continue
 
-        # Prefer text/html content
-        html_url = None
-        for cu in doc["content_urls"]:
-            if "html" in cu.get("content_type", ""):
-                html_url = cu["url"]
-                break
-
-        if not html_url:
-            # Fall back to first available
-            html_url = doc["content_urls"][0]["url"]
+        preference = {"text/html": 0, "application/xhtml+xml": 0, "text/plain": 1, "application/pdf": 2}
+        attachment = min(
+            doc["content_urls"],
+            key=lambda cu: preference.get(cu["content_type"].partition(";")[0].strip().lower(), 3),
+        )
 
         try:
-            content = client.fetch_binary(html_url)
-            content_str = content.decode("utf-8", errors="replace")
-
-            # Epic returns FHIR Binary resources as JSON with base64 data
-            import json as _json
-            import base64 as _b64
-            try:
-                binary_resource = _json.loads(content_str)
-                if binary_resource.get("resourceType") == "Binary" and "data" in binary_resource:
-                    decoded_bytes = _b64.b64decode(binary_resource["data"])
-                    content_str = decoded_bytes.decode("utf-8", errors="replace")
-            except (_json.JSONDecodeError, KeyError):
-                pass  # Not JSON — treat as raw content
-
-            # Convert HTML to plain text
-            plain_text = _html_to_text(content_str)
-
-            if plain_text.strip():
-                txt_path.write_text(plain_text)
-                logger.info(f"  Downloaded: {base_name}.txt ({len(plain_text)} chars)")
-                downloaded += 1
+            content = client.fetch_binary(attachment["url"])
+            extension, content = _document_content(content, attachment["content_type"])
+            downloaded += _write_new(records_dir / f"{base_name}{extension}", content)
 
         except TokenExpiredError:
-            logger.warning("Token expired during document download — stopping")
-            break
-        except Exception as e:
-            logger.warning(f"  Failed to download {base_name}: {e}")
+            raise
+        except Exception:
+            failures += 1
 
+    if failures:
+        raise DocumentDownloadError(
+            f"Could not save {failures} document(s); retry the sync."
+        )
     return downloaded

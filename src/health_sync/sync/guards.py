@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-"""Person-guard helpers shared across sync engines.
-
-Extracted from sync/engine.py so the FHIR engine (sync_provider) and the
-Tidepool engine (sync_tidepool_api) use the same logic. If the person-guard
-rule changes (e.g., a new override flag), both engines update together.
-"""
+"""Prevent cross-person access unless the caller explicitly overrides the assignment."""
 
 from health_sync.providers.registry import Provider
 

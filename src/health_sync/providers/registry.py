@@ -1,27 +1,18 @@
 from __future__ import annotations
 
-"""Multi-provider registry management.
-
-Manages the list of registered health systems in config/providers.json.
-Each provider has a slug, display name, FHIR base URL, assigned patient, and
-enabled flag.
-"""
+"""Read and update the hospital and Tidepool entries in config/providers.json."""
 
 import json
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
+
+from health_sync.config import ConfigError, load_json_object, validate_path_component
 
 
 class Provider(BaseModel):
-    """A registered health system or non-FHIR data source.
-
-    The `kind` discriminator distinguishes FHIR providers from non-FHIR
-    sources (currently: Tidepool legacy session-token API). Existing rows
-    in providers.json that omit `kind` default to "fhir" so the migration
-    is backward-compatible.
-    """
+    """A hospital connection (the default) or a Tidepool account."""
 
     slug: str
     name: str
@@ -30,6 +21,11 @@ class Provider(BaseModel):
     kind: Literal["fhir", "tidepool"] = "fhir"
     fhir_base_url: Optional[str] = None
     tidepool_api_base: Optional[str] = "https://api.tidepool.org"
+
+    @field_validator("slug", "patient")
+    @classmethod
+    def _validate_identifiers(cls, value: str) -> str:
+        return validate_path_component(value)
 
     @model_validator(mode="after")
     def _validate_kind_fields(self) -> "Provider":
@@ -49,8 +45,17 @@ class ProviderRegistry:
     def _load(self) -> list[Provider]:
         if not self.config_path.exists():
             return []
-        data = json.loads(self.config_path.read_text())
-        return [Provider(**p) for p in data.get("providers", [])]
+        data = load_json_object(self.config_path)
+        rows = data.get("providers", [])
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ConfigError(f"Invalid {self.config_path}: providers must be a list of objects.")
+        try:
+            providers = [Provider(**row) for row in rows]
+        except ValidationError as e:
+            raise ConfigError(f"Invalid provider settings in {self.config_path}. Check SETUP.md.") from e
+        if len({provider.slug for provider in providers}) != len(providers):
+            raise ConfigError(f"Duplicate provider slugs in {self.config_path}.")
+        return providers
 
     def _save(self, providers: list[Provider]) -> None:
         data = {"providers": [p.model_dump() for p in providers]}
@@ -84,13 +89,3 @@ class ProviderRegistry:
             return False
         self._save(filtered)
         return True
-
-    def set_enabled(self, slug: str, enabled: bool) -> bool:
-        """Enable or disable a provider. Returns True if found."""
-        providers = self._load()
-        for p in providers:
-            if p.slug == slug:
-                p.enabled = enabled
-                self._save(providers)
-                return True
-        return False

@@ -6,6 +6,8 @@ import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from health_sync.parsers.loop import NormalizedLoopRecord
 from health_sync.parsers.loop_rollup import DailyLoopSummary, HypoEvent
 from health_sync.writers.loop_daily import write_daily_summary
@@ -36,16 +38,41 @@ def test_jsonl_dedup_by_id(tmp_path: Path):
     assert ids == ["a", "b"]
 
 
-def test_jsonl_idempotent_byte_identical(tmp_path: Path):
+def test_jsonl_failed_atomic_replace_preserves_previous_file(tmp_path, monkeypatch):
+    d = date(2026, 5, 12)
+    first = _record("first", "2026-05-12T07:00:00Z", d)
+    out = write_raw_jsonl([first], tmp_path, d)
+    before = out.read_bytes()
+
+    def fail_replace(*args):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr("health_sync.auth.storage.os.replace", fail_replace)
+    with pytest.raises(OSError, match="simulated disk failure"):
+        write_raw_jsonl([first, _record("next", "2026-05-12T08:00:00Z", d)], tmp_path, d)
+    assert out.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [out]
+
+
+def test_jsonl_unchanged_content_does_not_replace_file(tmp_path, monkeypatch):
     d = date(2026, 5, 12)
     records = [
-        _record("z", "2026-05-12T08:00:00.000Z", d),
-        _record("a", "2026-05-12T07:00:00.000Z", d),
-        _record("m", "2026-05-12T07:30:00.000Z", d),
+        _record("z", "2026-05-12T08:00:00Z", d),
+        _record("a", "2026-05-12T07:00:00Z", d),
+        _record("m", "2026-05-12T07:30:00Z", d),
     ]
-    out1 = write_raw_jsonl(records, tmp_path, d).read_bytes()
-    out2 = write_raw_jsonl(records, tmp_path, d).read_bytes()
-    assert out1 == out2
+    out = write_raw_jsonl(records, tmp_path, d)
+    inode = out.stat().st_ino
+    before = out.read_bytes()
+
+    def unexpected_write(*args):
+        raise AssertionError("Unchanged raw history should not be rewritten")
+
+    monkeypatch.setattr("health_sync.writers.loop_raw.write_private_text", unexpected_write)
+    write_raw_jsonl(records, tmp_path, d)
+    assert out.stat().st_ino == inode
+    assert out.read_bytes() == before
+    assert out.stat().st_mode & 0o777 == 0o600
 
 
 def test_jsonl_sorted_by_time(tmp_path: Path):

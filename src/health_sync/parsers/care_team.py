@@ -58,4 +58,3 @@ def parse_care_team(resources: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 COLUMNS = ["Name", "Role", "Contact"]
-KEY_COLS = ["Name"]

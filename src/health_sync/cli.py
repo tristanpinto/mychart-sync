@@ -1,28 +1,19 @@
 from __future__ import annotations
 
-"""CLI entry point for chartstash.
-
-Commands:
-    chartstash auth <slug>          Authenticate with a health system
-    chartstash sync                 Sync providers to output files
-    chartstash fetch <resource>     Fetch and display raw FHIR data
-    chartstash persons list         List configured people
-    chartstash providers list       List registered providers
-    chartstash providers add        Add a health system
-    chartstash providers search     Search Epic's endpoint directory
-    chartstash providers remove     Remove a health system
-"""
+"""MyChart Sync commands. Run mychart-sync --help for usage."""
 
 import json
 import logging
 import re
 import time
+from pathlib import Path
 
 import click
+from pydantic import ValidationError
 
 from health_sync.auth.smart_auth import authenticate
 from health_sync.auth.token_store import StoredToken, TokenStore
-from health_sync.config import load_config
+from health_sync.config import ConfigError, load_config
 from health_sync.fhir.client import RESOURCE_TYPES, FHIRClient
 from health_sync.fhir.endpoints import SANDBOX_ENDPOINT, search_endpoints, validate_endpoint
 from health_sync.providers.registry import Provider, ProviderRegistry
@@ -31,6 +22,20 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s: %(message)s",
 )
+
+
+class ConfigErrorGroup(click.Group):
+    """Keep malformed local settings and credentials out of tracebacks."""
+
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except ConfigError as e:
+            raise click.ClickException(str(e)) from e
+        except (ValidationError, json.JSONDecodeError) as e:
+            raise click.ClickException(
+                "Invalid local settings or credentials. Check the file format in SETUP.md."
+            ) from e
 
 
 def _get_config():
@@ -46,10 +51,6 @@ def _get_registry(config=None):
     from health_sync.config import _project_root
 
     return ProviderRegistry(_project_root() / "config" / "providers.json")
-
-
-def _get_token_store(config, person: str):
-    return TokenStore(config.tokens_dir(person))
 
 
 def _provider_patient(provider: Provider) -> str:
@@ -92,10 +93,10 @@ def _project_cache_dir():
     return cache_dir
 
 
-@click.group()
+@click.group(cls=ConfigErrorGroup)
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging")
 def main(verbose: bool) -> None:
-    """chartstash: Sync medical records from Epic MyChart via SMART on FHIR."""
+    """mychart-sync: Sync medical records from Epic MyChart via SMART on FHIR."""
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
@@ -125,7 +126,7 @@ def auth(slug: str, person: str | None, timeout: int, override_patient: bool) ->
     provider = registry.get(slug)
     if provider is None:
         raise click.ClickException(
-            f"Provider '{slug}' not registered. Run: chartstash providers add"
+            f"Provider '{slug}' not registered. Run: mychart-sync providers add"
         )
 
     target_person = _resolve_person(config, provider, person, override_patient)
@@ -136,7 +137,7 @@ def auth(slug: str, person: str | None, timeout: int, override_patient: bool) ->
         return
 
     # FHIR OAuth flow
-    token_store = _get_token_store(config, target_person)
+    token_store = TokenStore(config.tokens_dir(target_person))
 
     client_id = config.get_client_id(slug)
     if not client_id:
@@ -224,7 +225,7 @@ def _auth_tidepool(provider, target_person: str, config) -> None:
     is_flag=True,
     help="Allow syncing a provider for a person other than provider.patient",
 )
-@click.option("--dry-run", is_flag=True, help="Fetch and parse but do not write to output files")
+@click.option("--dry-run", is_flag=True, help="Preview changes; still downloads raw FHIR data and may refresh tokens")
 @click.option("--full", is_flag=True, help="Full re-sync (ignore incremental state)")
 @click.option(
     "--bulk-import",
@@ -269,9 +270,11 @@ def sync(
     start_override = None
     if start_str:
         try:
-            start_override = datetime.fromisoformat(start_str).replace(
-                tzinfo=timezone.utc
-            )
+            start_override = datetime.fromisoformat(start_str)
+            if start_override.tzinfo is None:
+                start_override = start_override.replace(tzinfo=timezone.utc)
+            else:
+                start_override = start_override.astimezone(timezone.utc)
         except ValueError as e:
             raise click.ClickException(f"Invalid --start date: {e}") from e
 
@@ -294,45 +297,23 @@ def sync(
                 raise click.ClickException(str(e)) from e
 
     if not providers:
-        raise click.ClickException("No providers to sync. Run: chartstash providers add")
+        raise click.ClickException("No providers to sync. Run: mychart-sync providers add")
 
     mode = " (dry run)" if dry_run else ""
     mode += " (full)" if full else ""
     click.echo(f"Syncing {len(providers)} provider(s){mode}...\n")
 
-    # Special-case Tidepool dispatch when --start is used (sync_all doesn't
-    # forward the flag). For a single Tidepool provider, call sync_tidepool_api
-    # directly; for FHIR providers in the same run, use sync_all.
-    tidepool_providers = [p for p in providers if p.kind == "tidepool"]
-    fhir_providers = [p for p in providers if p.kind == "fhir"]
-
     try:
-        results: dict[str, dict[str, int]] = {}
-        if tidepool_providers:
-            from health_sync.sync.loop_engine import sync_tidepool_api
-
-            for tp in tidepool_providers:
-                target = person or tp.patient
-                tp_results = sync_tidepool_api(
-                    tp,
-                    target,
-                    config,
-                    dry_run=dry_run,
-                    full=full,
-                    override_patient=override_patient,
-                    start_override=start_override,
-                )
-                results[tp.slug] = tp_results
-        if fhir_providers:
-            fhir_results = sync_all(
-                config,
-                fhir_providers,
-                dry_run=dry_run,
-                full=full,
-                person=person,
-                override_patient=override_patient,
-            )
-            results.update(fhir_results)
+        # Preserve the existing Tidepool-first order for mixed-source runs.
+        results = sync_all(
+            config,
+            sorted(providers, key=lambda p: p.kind != "tidepool"),
+            dry_run=dry_run,
+            full=full,
+            person=person,
+            override_patient=override_patient,
+            start_override=start_override,
+        )
     except (PersonGuardError, SyncTokenError, LoopSyncError) as e:
         raise click.ClickException(str(e)) from e
 
@@ -381,12 +362,12 @@ def fetch(
     if provider_config.kind != "fhir":
         raise click.ClickException(
             f"'{provider}' is a {provider_config.kind} provider; "
-            f"the fetch command only supports FHIR. Use: chartstash sync "
+            f"the fetch command only supports FHIR. Use: mychart-sync sync "
             f"--provider {provider}"
         )
 
     target_person = _resolve_person(config, provider_config, person, override_patient)
-    token_store = _get_token_store(config, target_person)
+    token_store = TokenStore(config.tokens_dir(target_person))
 
     try:
         token = token_store.get_valid_token(
@@ -420,26 +401,6 @@ def fetch(
 # --- Providers ---
 
 
-@main.command()
-@click.argument("name")
-@click.option("--dry-run", is_flag=True, help="Preview without moving files")
-def migrate(name: str, dry_run: bool) -> None:
-    """Run a one-shot local state migration."""
-    if name != "v2-multi-tenant":
-        raise click.ClickException(f"Unknown migration '{name}'")
-
-    from health_sync.migrate import run_v2_multi_tenant_migration
-
-    try:
-        result = run_v2_multi_tenant_migration(dry_run=dry_run)
-    except OSError as e:
-        raise click.ClickException(str(e)) from e
-    click.echo(result.output)
-
-
-# --- Providers ---
-
-
 @main.group()
 def providers() -> None:
     """Manage health system connections."""
@@ -454,7 +415,7 @@ def providers_list() -> None:
 
     all_providers = registry.list_all()
     if not all_providers:
-        click.echo("No providers registered. Run: chartstash providers add")
+        click.echo("No providers registered. Run: mychart-sync providers add")
         return
 
     click.echo(f"{'Slug':<16} {'Patient':<10} {'Kind':<10} {'Status':<10} {'Authenticated-for':<18} Name")
@@ -462,7 +423,7 @@ def providers_list() -> None:
     for p in all_providers:
         authenticated_for = []
         for person in config.persons:
-            token_store = _get_token_store(config, person)
+            token_store = TokenStore(config.tokens_dir(person))
             if p.slug in token_store.list_authenticated():
                 authenticated_for.append(person)
         # Tidepool credentials check
@@ -501,6 +462,8 @@ def providers_add(
     """Register a new health system."""
     # Normalize slug
     slug = re.sub(r"[^a-z0-9-]", "-", slug.lower()).strip("-")
+    if not slug:
+        raise click.ClickException("Provider slug must contain a letter or number.")
 
     if validate:
         click.echo(f"Validating endpoint... ", nl=False)
@@ -527,9 +490,9 @@ def providers_add(
 
     try:
         registry.add(provider)
-        click.echo(f"Added '{slug}'. Next: chartstash auth {slug}")
+        click.echo(f"Added '{slug}'. Next: mychart-sync auth {slug}")
     except ValueError as e:
-        click.echo(f"Error: {e}")
+        raise click.ClickException(str(e)) from e
 
 
 @providers.command("search")
@@ -569,7 +532,7 @@ def providers_remove(slug: str, yes: bool) -> None:
             return
 
     registry.remove(slug)
-    token_store = _get_token_store(config, _provider_patient(provider))
+    token_store = TokenStore(config.tokens_dir(_provider_patient(provider)))
     token_store.delete(slug)
     click.echo(f"Removed '{slug}'.")
 
@@ -583,7 +546,7 @@ def providers_add_sandbox() -> None:
     provider = Provider(**SANDBOX_ENDPOINT, patient=config.default_person)
     try:
         registry.add(provider)
-        click.echo(f"Added Epic sandbox. Next: chartstash auth epic-sandbox")
+        click.echo(f"Added Epic sandbox. Next: mychart-sync auth epic-sandbox")
     except ValueError:
         click.echo("Epic sandbox already registered.")
 
@@ -621,15 +584,15 @@ def tidepool() -> None:
     "--file",
     "export_file",
     required=True,
-    type=click.Path(exists=True, dir_okay=False, path_type=__import__("pathlib").Path),
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="Path to a Tidepool web-UI JSON export file",
 )
 @click.option("--dry-run", is_flag=True, help="Parse + roll up but do not write output files")
 def tidepool_import_export(person: str, export_file, dry_run: bool) -> None:
     """Import a Tidepool web-UI JSON export into the output directory.
 
-    Export via tidepool.org → Account → Export Patient Data. This command
-    writes per-day JSONL and Markdown to loop_raw_dir and loop_daily_dir.
+    Use Export Data at app.tidepool.org and choose JSON; see docs/tidepool.md.
+    Writes per-day JSONL and Markdown to the configured output directory.
     """
     from health_sync.sync.loop_engine import LoopSyncError, sync_from_export
 

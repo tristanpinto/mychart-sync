@@ -3,19 +3,14 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from health_sync.parsers.observations import parse_lab_observations
-from health_sync.writers.clinical_extract import update_clinical_extract
+from health_sync.writers.clinical_extract import render_clinical_extract
 from health_sync.writers.documents import download_documents
-from health_sync.writers.health_profile import update_health_profile
-from health_sync.writers.lab_results import update_lab_results
+from health_sync.writers.lab_results import render_lab_results
 
 
-def test_clinical_extract_placeholder_is_scaffolded_before_update(tmp_path):
-    path = tmp_path / "clinical_extract.md"
-    path.write_text("# Clinical Extract\n\nPlaceholder created before first auth.\n")
-
-    text = update_clinical_extract(
-        path,
-        {
+def test_clinical_extract_includes_sections_and_source():
+    text = render_clinical_extract(
+        {"sutter": {"name": "Sutter Health", "resources": {
             "Condition": [
                 {
                     "resourceType": "Condition",
@@ -24,8 +19,7 @@ def test_clinical_extract_placeholder_is_scaffolded_before_update(tmp_path):
                     "clinicalStatus": {"text": "Active"},
                 }
             ],
-        },
-        "Sutter Health",
+        }}},
     )
 
     assert "## Active Problems" in text
@@ -47,29 +41,23 @@ def test_narrative_pathology_observation_is_saved_as_record(tmp_path):
         records_dir=tmp_path,
     )
 
-    path = tmp_path / "2020-01-01_surgical_report.txt"
+    paths = list(tmp_path.glob("2020-01-01_surgical_report_*.txt"))
     assert count == 1
-    assert path.exists()
-    assert "FINAL MICROSCOPIC DIAGNOSIS" in path.read_text()
+    assert len(paths) == 1
+    assert "FINAL MICROSCOPIC DIAGNOSIS" in paths[0].read_text()
 
 
-def test_lab_results_are_globally_sorted_by_date(tmp_path):
-    path = tmp_path / "lab_results.md"
-    path.write_text(
-        "# Lab Results\n\n"
-        "Canonical labs.\n\n"
-        "## 2026-05-05 (Sutter Health)\n\n"
-        "**Source:** Sutter Health — FHIR sync\n\n"
-        "| Test | Value | Unit | Ref Range | Flag |\n"
-        "|---|---|---|---|---|\n"
-        "| Hemoglobin A1c | 6.0 | % | 4.0–5.6 | **High** |\n\n"
-        "---\n"
-    )
-
-    text = update_lab_results(
-        path,
+def test_lab_results_are_globally_sorted_by_date():
+    text = render_lab_results(
         {
-            "Observation_laboratory": [
+            "sutter": {"name": "Sutter Health", "resources": {
+                "Observation_laboratory": [{
+                    "resourceType": "Observation", "id": "lab-1",
+                    "code": {"text": "Hemoglobin A1c"},
+                    "effectiveDateTime": "2026-05-05", "valueQuantity": {"value": 6, "unit": "%"},
+                }],
+            }},
+            "ucsf": {"name": "UCSF Health", "resources": {"Observation_laboratory": [
                 {
                     "resourceType": "Observation",
                     "status": "final",
@@ -77,24 +65,21 @@ def test_lab_results_are_globally_sorted_by_date(tmp_path):
                     "effectiveDateTime": "2018-06-14T22:00:00Z",
                     "valueQuantity": {"value": 7, "unit": "%"},
                 }
-            ]
+            ]}},
         },
-        "UCSF Health",
     )
 
-    assert text.index("## 2018-06-14 (UCSF Health)") < text.index(
-        "## 2026-05-05 (Sutter Health)"
-    )
+    assert text.index("## 2018-06-14") < text.index("## 2026-05-05")
+    assert "UCSF Health" in text
+    assert "Sutter Health" in text
 
 
-def test_clinical_extract_splits_recent_and_historical_rows(tmp_path):
-    path = tmp_path / "clinical_extract.md"
+def test_clinical_extract_splits_recent_and_historical_rows():
     recent_date = date.today().isoformat()
     historical_date = (date.today() - timedelta(days=RECENT_WINDOW_FOR_TESTS)).isoformat()
 
-    text = update_clinical_extract(
-        path,
-        {
+    text = render_clinical_extract(
+        {"test": {"name": "Test Health", "resources": {
             "MedicationRequest": [
                 {
                     "resourceType": "MedicationRequest",
@@ -137,8 +122,7 @@ def test_clinical_extract_splits_recent_and_historical_rows(tmp_path):
                     "location": [{"location": {"display": "Historical Clinic"}}],
                 },
             ],
-        },
-        "Test Health",
+        }}},
     )
 
     assert text.index("### Active") < text.index("Recent active med")
@@ -149,12 +133,9 @@ def test_clinical_extract_splits_recent_and_historical_rows(tmp_path):
     assert text.index("### Historical") < text.index("170.0")
 
 
-def test_clinical_extract_sorts_structured_tables(tmp_path):
-    path = tmp_path / "clinical_extract.md"
-
-    text = update_clinical_extract(
-        path,
-        {
+def test_clinical_extract_sorts_structured_tables():
+    text = render_clinical_extract(
+        {"test": {"name": "Test Health", "resources": {
             "Immunization": [
                 {
                     "resourceType": "Immunization",
@@ -179,41 +160,11 @@ def test_clinical_extract_sorts_structured_tables(tmp_path):
                     "performedDateTime": "2026-01-01",
                 },
             ],
-        },
-        "Test Health",
+        }}},
     )
 
     assert text.index("Newer vaccine") < text.index("Older vaccine")
     assert text.index("Newer procedure") < text.index("Older procedure")
-
-
-def test_health_profile_writer_is_manual_only(tmp_path):
-    path = tmp_path / "health_profile.md"
-    original = "# Health Profile\n\nCurated summary.\n"
-    path.write_text(original)
-
-    result = update_health_profile(
-        path,
-        {
-            "Immunization": [
-                {
-                    "resourceType": "Immunization",
-                    "vaccineCode": {"text": "FHIR vaccine"},
-                    "occurrenceDateTime": "2026-01-01",
-                }
-            ],
-            "Observation_social-history": [
-                {
-                    "resourceType": "Observation",
-                    "code": {"text": "Tobacco smoking status"},
-                    "valueString": "Never",
-                }
-            ],
-        },
-    )
-
-    assert result == original
-    assert path.read_text() == original
 
 
 def _narrative_pathology_observation():

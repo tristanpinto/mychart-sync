@@ -3,27 +3,26 @@ from __future__ import annotations
 """Sync engine: orchestrates fetch → parse → write pipeline."""
 
 import logging
-from typing import Any
+from datetime import datetime, timezone
+from pathlib import Path
 
 from health_sync.auth.token_store import TokenStore
 from health_sync.config import AppConfig
 from health_sync.fhir.client import FHIRClient, TokenExpiredError
 from health_sync.providers.registry import Provider
 from health_sync.sync.guards import PersonGuardError, check_person_guard, provider_patient
-from health_sync.sync.state import SyncState, hash_resources
-from health_sync.writers.clinical_extract import update_clinical_extract
+from health_sync.sync.state import SyncState
+from health_sync.sync.records import load_sources, records_lock, merge_source, save_source
+from health_sync.writers.clinical_extract import render_clinical_extract
 from health_sync.writers.documents import download_documents
-from health_sync.writers.lab_results import update_lab_results
+from health_sync.writers.lab_results import render_lab_results
+from health_sync.writers.generated import write_generated
 
 logger = logging.getLogger(__name__)
 
 
 class SyncTokenError(RuntimeError):
     """Raised when a provider cannot sync because auth is missing or expired."""
-
-
-# Backward-compat: re-export for existing imports
-_provider_patient = provider_patient
 
 
 def sync_provider(
@@ -33,26 +32,13 @@ def sync_provider(
     dry_run: bool = False,
     full: bool = False,
     override_patient: bool = False,
+    start_override: datetime | None = None,
 ) -> dict[str, int]:
-    """Sync all data from a single provider into output files.
+    """Sync one provider and return fetched counts.
 
-    Dispatches on provider.kind:
-    - "fhir" → FHIR-shaped sync (this function below)
-    - "tidepool" → delegated to sync/loop_engine.sync_tidepool_api
-
-    Args:
-        provider: The provider to sync.
-        person: Person whose scoped tokens, state, cache, and output paths are used.
-        config: App configuration with output paths.
-        dry_run: If True, fetch and parse but don't write to output files.
-        full: If True, ignore last sync timestamp and fetch everything.
-        override_patient: If True, allow syncing a provider for a non-default person.
-
-    Returns:
-        Dict of resource type → count of resources fetched.
+    A dry run saves FHIR JSON and previews Markdown without advancing state.
+    start_override applies only to Tidepool.
     """
-    # Kind dispatch (Phase 2). Defaults to fhir for backward compat with rows
-    # in providers.json (and test fixtures) that omit `kind`.
     if getattr(provider, "kind", "fhir") == "tidepool":
         from health_sync.sync.loop_engine import sync_tidepool_api
 
@@ -63,15 +49,27 @@ def sync_provider(
             dry_run=dry_run,
             full=full,
             override_patient=override_patient,
+            start_override=start_override,
         )
 
     check_person_guard(provider, person, override_patient)
 
     # Validate person-scoped output paths before constructing stores that create dirs.
-    config.output_path("clinical_extract", person)
-    config.output_path("lab_results", person)
+    summary_paths = {config.output_path(key, person) for key in ("clinical_extract", "lab_results")}
+    if len(summary_paths) != 2 or config.output_path("health_profile", person) in summary_paths:
+        raise ValueError("Clinical extract, labs, and manual health profile must use different files.")
     config.output_path("records_dir", person)
 
+    cache_dir = config.fhir_cache_dir(person, provider.slug)
+    with records_lock(cache_dir.parent):
+        return _sync_fhir(provider, person, config, cache_dir, dry_run, full)
+
+
+def _sync_fhir(
+    provider: Provider, person: str, config: AppConfig,
+    cache_dir: Path, dry_run: bool, full: bool,
+) -> dict[str, int]:
+    """Run under the person's lock, including any refresh-token rotation."""
     token_store = TokenStore(config.tokens_dir(person))
     sync_state = SyncState(config.sync_state_dir(person))
 
@@ -86,98 +84,66 @@ def sync_provider(
         logger.error(f"{provider.name}: {e}")
         raise SyncTokenError(str(e)) from e
 
-    # Determine incremental fetch window
-    since = None
-    if not full:
-        since = sync_state.get_last_sync(provider.slug)
-        if since:
-            logger.info(f"Incremental sync since {since}")
-
-    # Fetch all resources
-    cache_dir = config.fhir_cache_dir(person, provider.slug)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
     logger.info(f"Fetching data from {provider.name}...")
-
     try:
-        client = FHIRClient(
+        with FHIRClient(
             base_url=token.fhir_base_url,
             access_token=token.access_token,
             patient_id=token.patient_id,
-            cache_dir=cache_dir,
-        )
-        fhir_data = client.fetch_all(since=since)
+            cache_dir=None,  # The complete, validated fetch is retained atomically below.
+        ) as client:
+            sources = load_sources(cache_dir.parent, person)
+            previous = sources.get(provider.slug, {})
+            since = None
+            if not full and previous.get("full_fetch_complete"):
+                since = sync_state.get_last_sync(provider.slug)
+            if since:
+                logger.info(f"Incremental sync since {since}")
+            # Persist the start, not the finish, so updates during the fetch aren't missed.
+            started_at = datetime.now(timezone.utc).isoformat()
+            fhir_data = client.fetch_all(since=since)
+            sources[provider.slug] = merge_source(
+                person, provider.name, token.patient_id,
+                token.fhir_base_url, previous, fhir_data,
+            )
+            # Parse all retained sources before changing JSON or either summary.
+            clinical = render_clinical_extract(sources)
+            labs = render_lab_results(sources)
+            for slug, source in sources.items():
+                if slug != provider.slug and not (cache_dir.parent / slug / "records.json").exists():
+                    save_source(cache_dir.parent, slug, source)
+            save_source(cache_dir.parent, provider.slug, sources[provider.slug])
+            counts = {
+                key: sum(r.get("resourceType") != "OperationOutcome" for r in resources)
+                for key, resources in fhir_data.items()
+            }
+
+            logger.info(f"Fetched {sum(counts.values())} resources from {provider.name}")
+
+            if dry_run:
+                _print_preview(clinical)
+                return counts
+
+            # Retry missing documents from retained metadata even after an empty fetch.
+            records_dir = config.output_path("records_dir", person)
+            doc_count = download_documents(sources[provider.slug]["resources"], client, records_dir)
+            logger.info(f"Downloaded {doc_count} clinical documents")
+
+            write_generated(config.output_path("clinical_extract", person), clinical)
+            write_generated(config.output_path("lab_results", person), labs)
+            if since is None:
+                sources[provider.slug]["full_fetch_complete"] = True
+                save_source(cache_dir.parent, provider.slug, sources[provider.slug])
+            sync_state.record_sync(
+                provider.slug, counts, synced_at=started_at
+            )
+            return counts
     except TokenExpiredError:
         logger.error(
             f"Token expired for {provider.name}. "
-            f"Run: chartstash auth {provider.slug}"
+            f"Run: mychart-sync auth {provider.slug}"
         )
         raise SyncTokenError(f"Token expired for {provider.slug}")
-
-    # Count resources (excluding OperationOutcome)
-    counts = {}
-    resource_hashes = {}
-    for key, resources in fhir_data.items():
-        real = [r for r in resources if r.get("resourceType") != "OperationOutcome"]
-        counts[key] = len(real)
-        if real:
-            resource_hashes[key] = hash_resources(real)
-
-    total = sum(counts.values())
-    logger.info(f"Fetched {total} resources from {provider.name}")
-    for k, v in counts.items():
-        if v > 0:
-            logger.info(f"  {k}: {v}")
-
-    # Check for changes
-    if not full and resource_hashes:
-        has_changes, changed = sync_state.has_changes(provider.slug, resource_hashes)
-        if not has_changes:
-            logger.info("No changes detected — skipping write")
-            sync_state.record_sync(provider.slug, counts, resource_hashes)
-            client.close()
-            return counts
-        if changed:
-            logger.info(f"Changes detected in: {', '.join(changed)}")
-
-    if dry_run:
-        logger.info("Dry run — not writing to output files")
-        _print_preview(fhir_data, config, provider.name, person)
-        client.close()
-        return counts
-
-    # Write to output files
-    logger.info("Writing to output files...")
-
-    # clinical_extract.md
-    clinical_path = config.output_path("clinical_extract", person)
-    clinical_path.parent.mkdir(parents=True, exist_ok=True)
-    update_clinical_extract(clinical_path, fhir_data, provider.name)
-    logger.info(f"  Updated {clinical_path}")
-
-    # lab_results.md
-    lab_path = config.output_path("lab_results", person)
-    lab_path.parent.mkdir(parents=True, exist_ok=True)
-    update_lab_results(lab_path, fhir_data, provider.name)
-    logger.info(f"  Updated {lab_path}")
-
-    # Download clinical documents
-    records_dir = config.output_path("records_dir", person)
-    try:
-        doc_count = download_documents(fhir_data, client, records_dir)
-        if doc_count:
-            logger.info(f"  Downloaded {doc_count} clinical documents to {records_dir}")
-    except Exception as e:
-        logger.warning(f"  Document download failed: {e}")
-
-    client.close()
-
-    # Record sync state
-    sync_state.record_sync(provider.slug, counts, resource_hashes)
-    logger.info("Sync state saved")
-
-    return counts
-
 
 def sync_all(
     config: AppConfig,
@@ -186,23 +152,12 @@ def sync_all(
     full: bool = False,
     person: str | None = None,
     override_patient: bool = False,
+    start_override: datetime | None = None,
 ) -> dict[str, dict[str, int]]:
-    """Sync all enabled providers.
-
-    Args:
-        config: App configuration.
-        providers: List of providers to sync.
-        dry_run: If True, fetch and parse but don't write.
-        full: If True, ignore incremental state.
-        person: Optional person override. Defaults to each provider's patient.
-        override_patient: If True, allow syncing a provider for a non-default person.
-
-    Returns:
-        Dict of provider slug → resource counts.
-    """
+    """Sync providers in order, using each assigned person unless overridden."""
     results = {}
     for provider in providers:
-        target_person = person or _provider_patient(provider)
+        target_person = person or provider_patient(provider)
         logger.info(f"\n{'='*50}")
         logger.info(f"Syncing {provider.name} for {target_person}...")
         logger.info(f"{'='*50}")
@@ -213,27 +168,15 @@ def sync_all(
             dry_run=dry_run,
             full=full,
             override_patient=override_patient,
+            start_override=start_override,
         )
 
     return results
 
 
-def _print_preview(
-    fhir_data: dict[str, list[dict[str, Any]]],
-    config: AppConfig,
-    provider_name: str,
-    person: str,
-) -> None:
+def _print_preview(result: str) -> None:
     """Print a preview of what would be written (for dry-run mode)."""
-    # Write to a temp path to see the output
-    tmp = config.cache_dir(person) / "dry_run_preview.md"
-    result = update_clinical_extract(tmp, fhir_data, provider_name)
-
     print("\n--- DRY RUN PREVIEW: clinical_extract.md ---")
     print(result[:3000])
     if len(result) > 3000:
         print(f"\n... ({len(result)} chars total, truncated)")
-
-    # Clean up
-    if tmp.exists():
-        tmp.unlink()

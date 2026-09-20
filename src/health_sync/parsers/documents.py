@@ -6,17 +6,7 @@ from typing import Any
 
 
 def parse_document_references(resources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Parse DocumentReference resources into document metadata.
-
-    Returns metadata for each document. Actual content download happens
-    separately via Binary.Read.
-
-    Args:
-        resources: List of FHIR DocumentReference resources.
-
-    Returns:
-        List of document metadata dicts.
-    """
+    """Extract document metadata and attachment URLs; content is downloaded separately."""
     docs = []
     for r in resources:
         if r.get("resourceType") != "DocumentReference":

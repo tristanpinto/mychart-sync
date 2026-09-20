@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "chartstash"
+name = "mychart-sync"
 version = "0.1.0"
-description = "Your MyChart records as local Markdown and JSON"
+description = "Download MyChart and Tidepool records as local Markdown and JSON"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -22,7 +22,7 @@ dev = [
 ]
 
 [project.scripts]
-chartstash = "health_sync.cli:main"
+mychart-sync = "health_sync.cli:main"
 health-sync = "health_sync.cli:main"
 
 [tool.hatch.build.targets.wheel]

@@ -2,17 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from health_sync.migrate import run_v2_multi_tenant_migration
+from health_sync.auth.token_store import TokenStore
 from health_sync.sync import engine
 
 
-def test_person_a_paths_stay_stable_after_migration(
+def test_legacy_person_paths_stay_stable(
     monkeypatch,
     app_config,
     providers_file,
     person_a_legacy_state,
     mock_fhir_client,
     fake_provider_factory,
+    stored_token_factory,
 ) -> None:
     root = person_a_legacy_state
     expected_paths = {
@@ -36,11 +37,10 @@ def test_person_a_paths_stay_stable_after_migration(
         written_paths.append(path)
         return path.read_text()
 
-    run_v2_multi_tenant_migration(config=app_config)
+    TokenStore(app_config.tokens_dir("person_a")).save(stored_token_factory())
 
     monkeypatch.setattr(engine, "FHIRClient", mock_fhir_client)
-    monkeypatch.setattr(engine, "update_clinical_extract", write_marker)
-    monkeypatch.setattr(engine, "update_lab_results", write_marker)
+    monkeypatch.setattr(engine, "write_generated", write_marker)
     monkeypatch.setattr(engine, "download_documents", lambda *args, **kwargs: 0)
 
     engine.sync_provider(

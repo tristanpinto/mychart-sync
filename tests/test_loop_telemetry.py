@@ -78,6 +78,7 @@ def test_render_skips_all_time_for_short_span():
     assert "Last 7 days" in out
     assert "Last 30 days" in out
     assert "All-time" not in out
+    assert "| **Hypo events: level 1** | 0 |" in out
 
 
 def test_render_includes_all_time_for_long_span():
@@ -103,7 +104,7 @@ def test_render_recent_days_glance_marks_hypo_events():
         _summary(today - timedelta(days=1)),
     ]
     out = render_loop_telemetry(summaries, today)
-    assert "L2×1" in out  # level-2 hypo on recent day
+    assert "L2×1, L1×1" in out
 
 
 def test_render_marks_low_confidence_in_glance():
@@ -123,11 +124,3 @@ def test_write_loop_telemetry_idempotent(tmp_path: Path):
     a = write_loop_telemetry(summaries, out_path, today=today).read_bytes()
     b = write_loop_telemetry(summaries, out_path, today=today).read_bytes()
     assert a == b
-
-
-def test_period_table_shows_zero_hypos_when_none():
-    today = date(2026, 5, 13)
-    summaries = [_summary(today - timedelta(days=i)) for i in range(7)]
-    out = render_loop_telemetry(summaries, today)
-    # zero hypos still shown as 0, not omitted
-    assert "Hypo events: level 1" in out

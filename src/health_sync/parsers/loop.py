@@ -2,23 +2,20 @@ from __future__ import annotations
 
 """Parse Tidepool diabetes records into a normalized internal form.
 
-Tidepool record types we handle in MVP:
+Supported Tidepool record types:
 - cbg: continuous glucose (Dexcom)
 - smbg: fingerstick (rare for Loop users)
 - bolus: insulin bolus (sum 'normal' + optional 'extended')
 - basal: insulin basal segment (rate × duration; duration may need forward-fill)
 - food: carb entry; 'nutrition' is a JSON-encoded string
 
-Deferred to Phase 2/3: deviceEvent, dosingDecision, pumpStatus, controllerStatus.
-
 Daily binning uses each record's own 'timezoneOffset' (minutes from UTC) when
-present; falls back to a Person.timezone when missing. This is strictly more
-correct than any hardcoded timezone — handles moves and travel
-automatically.
+present; falls back to the person's configured timezone when missing.
 """
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Iterator, Literal
@@ -67,8 +64,7 @@ def compute_local_date(record: dict, fallback_tz: str = "America/Los_Angeles") -
     """Compute the local-tz date for a record.
 
     Prefers the record's own timezoneOffset (per Tidepool spec, minutes from UTC).
-    Falls back to fallback_tz when timezoneOffset is missing (~11.5% of records,
-    typically alerts and Loop internal telemetry).
+    Falls back to fallback_tz when timezoneOffset is missing.
     """
     time_utc = parse_time(record["time"])
     offset = record.get("timezoneOffset")
@@ -107,11 +103,14 @@ def _parse_bolus(record: dict, fallback_tz: str) -> NormalizedLoopRecord | None:
     - 'automated' — Loop algorithm-issued micro-bolus (counts toward basal
       delivery in Tidepool's classification, since it's not user-decided)
     """
-    normal = record.get("normal", 0) or 0
-    extended = record.get("extended", 0) or 0
-    total = float(normal) + float(extended)
-    if total == 0:
-        return None  # nothing actually delivered
+    amounts = [record[key] for key in ("normal", "extended") if key in record]
+    if not amounts or any(value is None or isinstance(value, bool) for value in amounts):
+        return None
+    doses = [float(value) for value in amounts]
+    if any(not math.isfinite(value) or value < 0 for value in doses):
+        return None
+    # Keep explicit zero corrections so they can replace earlier values by ID.
+    total = sum(doses)
 
     return NormalizedLoopRecord(
         kind="bolus",
@@ -128,7 +127,7 @@ def _parse_basal(record: dict, fallback_tz: str) -> NormalizedLoopRecord | None:
 
     Tidepool basal records have:
     - rate: U/hr
-    - duration: ms (NOT minutes); 0 indicates open-ended/unknown
+    - duration: minutes (the API source converts from milliseconds)
     - deliveryType: 'scheduled' | 'automated' | 'suspend'
     - annotations (JSON string): may contain {'code':'basal/unknown-duration'}
 
@@ -136,12 +135,6 @@ def _parse_basal(record: dict, fallback_tz: str) -> NormalizedLoopRecord | None:
     For records with duration=0 or unknown-duration annotation, we flag open_ended;
     the rollup forward-fills duration from the successor record's time.
 
-    Note on duration units: empirically verified against this export — adjacent
-    basal records' gaps in time match their stated 'duration' field when the
-    field is interpreted as MINUTES (e.g., a record at 20:11:07 with dur=5.0214
-    is followed by a record at 20:16:08 — exactly 5.02 minutes later).
-    Tidepool's docs say milliseconds for the underlying API; the web-UI export
-    appears to pre-convert to minutes. Phase 2 (API) will need re-verification.
     """
     delivery_type = record.get("deliveryType")
     if delivery_type not in ("scheduled", "automated", "suspend"):
@@ -211,7 +204,7 @@ _PARSERS = {
     "food": _parse_food,
 }
 
-# Types we intentionally ignore in MVP (preserved in raw JSONL)
+# Unsupported types are omitted from both summaries and generated JSONL.
 _KNOWN_IGNORED = {
     "pumpStatus",
     "controllerStatus",
@@ -232,7 +225,7 @@ def parse_records(
     """Parse an iterable of Tidepool records into normalized form.
 
     Unknown types log a warning once per type per call (to avoid spam).
-    Known-ignored types are silently skipped (kept in raw JSONL).
+    Known-ignored types are silently skipped.
     """
     seen_unknown: set[str] = set()
     for record in records:

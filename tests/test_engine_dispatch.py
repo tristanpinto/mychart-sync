@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-"""Tests for sync engine dispatch on provider.kind.
-
-Critical regression coverage: FHIR providers must continue routing through
-the existing sync_provider FHIR path after the discriminator is added. Without
-this test, a bug in the kind-branch could silently break Person A's daily cron.
-"""
+"""FHIR and Tidepool provider routing, including legacy configuration."""
 
 import pytest
 
@@ -69,12 +64,7 @@ def test_tidepool_provider_routes_through_loop_engine(monkeypatch, app_config):
         return {"raw_records": 0}
 
     monkeypatch.setattr(loop_engine, "sync_tidepool_api", fake_tidepool)
-    # also monkeypatch the import inside sync_provider
-    monkeypatch.setattr(
-        "health_sync.sync.engine.sync_tidepool_api", fake_tidepool, raising=False
-    )
-
-    result = engine.sync_provider(_tidepool_provider(), "person_b", app_config)
+    engine.sync_provider(_tidepool_provider(), "person_b", app_config)
 
     assert called_with["slug"] == "tidepool"
     assert called_with["kind"] == "tidepool"

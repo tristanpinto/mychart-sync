@@ -65,4 +65,3 @@ def parse_procedures(resources: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 COLUMNS = ["Procedure", "Date", "Associated Diagnosis"]
-KEY_COLS = ["Procedure", "Date"]

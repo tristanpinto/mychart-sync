@@ -96,4 +96,3 @@ def parse_encounters(resources: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 COLUMNS = ["Date", "Type", "Department", "Care Team", "Provider Notes", "Other Notes"]
-KEY_COLS = ["Date", "Department"]

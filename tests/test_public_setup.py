@@ -56,13 +56,14 @@ def test_first_sync_writes_plain_output(
         import httpx
 
         if "/Patient/" in request.url.path:
-            return httpx.Response(200, json={"resourceType": "Patient", "id": "synthetic-patient"})
+            return httpx.Response(200, json={"resourceType": "Patient", "id": token.patient_id})
         entries = []
         if request.url.path.endswith("/Condition"):
-            entries = [{"resource": {"resourceType": "Condition", "code": {"text": "Example condition"}}}]
+            entries = [{"resource": {"resourceType": "Condition", "id": "condition-1", "code": {"text": "Example condition"}}}]
         if request.url.path.endswith("/Observation") and request.url.params.get("category") == "laboratory":
             entries = [{"resource": {
-                "resourceType": "Observation", "code": {"text": "Example lab"},
+                "resourceType": "Observation", "id": "lab-1", "code": {"text": "Example lab"},
+                "category": [{"coding": [{"code": "laboratory"}]}],
                 "effectiveDateTime": "2020-01-01T12:00:00Z",
                 "valueQuantity": {"value": 10, "unit": "mg/dL"},
             }}]
@@ -74,7 +75,7 @@ def test_first_sync_writes_plain_output(
 
     out = tmp_health_sync_root / "output"
     raw = config.fhir_cache_dir("me", "hospital")
-    assert json.loads((raw / "patient.json").read_text())["id"] == "synthetic-patient"
+    assert json.loads((raw / "records.json").read_text())["resources"]["Patient"][0]["id"] == token.patient_id
     if dry_run:
         assert not (out / "clinical_extract.md").exists()
         assert not (out / "labs/lab_results.md").exists()

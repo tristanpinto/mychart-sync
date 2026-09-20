@@ -1,17 +1,40 @@
 from __future__ import annotations
 
-"""Configuration loading for chartstash."""
+"""Configuration loading for mychart-sync."""
 
 import json
 import os
 from pathlib import Path
 from typing import Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+
+class ConfigError(ValueError):
+    """A local configuration error that is safe to show without its contents."""
+
+
+def validate_path_component(value: str) -> str:
+    if not value.strip() or value in {".", ".."} or any(c in value for c in ("/", "\\", "\0")):
+        raise ValueError("Identifiers must be nonempty names without path separators")
+    return value
+
+
+def load_json_object(path: Path) -> dict:
+    """Read local settings without exposing their values in parse errors."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, UnicodeError) as e:
+        raise ConfigError(f"Invalid JSON in {path}. Check commas, quotes, and braces.") from e
+    except OSError as e:
+        raise ConfigError(f"Cannot read {path}. Check that it exists and is readable.") from e
+    if not isinstance(data, dict):
+        raise ConfigError(f"Invalid {path}: expected a JSON object.")
+    return data
 
 
 def _project_root() -> Path:
-    """Return the chartstash project root (where pyproject.toml lives)."""
+    """Return the mychart-sync project root (where pyproject.toml lives)."""
     return Path(__file__).resolve().parent.parent.parent
 
 
@@ -52,7 +75,10 @@ class Person(BaseModel):
             for value in self.paths.model_dump().values()
             if value is not None
         ]
-        common = os.path.commonpath(path_values)
+        try:
+            common = os.path.commonpath(path_values)
+        except ValueError as e:
+            raise ConfigError("Output paths must all be relative to output_dir.") from e
         return (self.output_dir / common).resolve()
 
 
@@ -70,6 +96,8 @@ class AppConfig(BaseModel):
     def validate_person_names(cls, v: dict[str, Person]) -> dict[str, Person]:
         if not v:
             raise ValueError("At least one person must be configured")
+        for name in v:
+            validate_path_component(name)
         return v
 
     @model_validator(mode="after")
@@ -91,23 +119,24 @@ class AppConfig(BaseModel):
         person_config = self.person(person)
         rel = getattr(person_config.paths, key)
         if rel is None:
-            raise ValueError(f"Path '{key}' is not configured for person '{person}'")
+            raise ConfigError(f"Path '{key}' is not configured for this person")
 
         rel_path = Path(rel)
         if rel_path.is_absolute():
-            raise ValueError(f"Path '{key}' for person '{person}' must be relative")
+            raise ConfigError(f"Path '{key}' must be relative")
 
         result = (person_config.output_dir / rel_path).resolve()
+        if not result.is_relative_to(person_config.output_dir.resolve()):
+            raise ConfigError(f"Path '{key}' escapes allowed root (output_dir)")
         allowed_root = person_config.allowed_root()
         if not result.is_relative_to(allowed_root):
-            raise ValueError(
-                f"Path '{key}' for person '{person}' escapes allowed root {allowed_root}"
-            )
+            raise ConfigError(f"Path '{key}' escapes allowed root for this person")
         return result
 
     brain_path = output_path  # Keep existing callers working.
 
     def fhir_cache_dir(self, person: str, slug: str) -> Path:
+        validate_path_component(slug)
         if self.person(person).paths.raw_fhir_dir is not None:
             return self.output_path("raw_fhir_dir", person) / slug
         return self.cache_dir(person) / "fhir" / slug
@@ -138,9 +167,13 @@ class AppConfig(BaseModel):
 
         Checks for a per-provider secret file (secrets/{slug}_secrets.json).
         """
+        validate_path_component(slug)
         provider_secret_file = self.secrets_dir() / f"{slug.replace('-', '_')}_secrets.json"
         if provider_secret_file.exists():
-            return json.loads(provider_secret_file.read_text())
+            data = load_json_object(provider_secret_file)
+            if any(not isinstance(data.get(env, {}), dict) for env in ("production", "non_production")):
+                raise ConfigError(f"Invalid environment settings in {provider_secret_file}.")
+            return data
         return None
 
     def _provider_env(self, slug: str) -> str:
@@ -179,6 +212,8 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             f"Missing {config_path}. Copy config/app.example.json to config/app.json "
             "and set your Epic client ID."
         )
-    with open(config_path) as f:
-        data = json.load(f)
-    return AppConfig(**data)
+    data = load_json_object(config_path)
+    try:
+        return AppConfig(**data)
+    except ValidationError as e:
+        raise ConfigError(f"Invalid settings in {config_path}. Compare fields with config/app.example.json.") from e

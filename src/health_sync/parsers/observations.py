@@ -55,19 +55,7 @@ def _is_narrative_lab_report(resource: dict[str, Any]) -> bool:
 
 
 def parse_lab_observations(resources: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """Parse laboratory Observation resources into lab result rows.
-
-    Target format:
-        | Test | Value | Unit | Ref Range | Flag |
-
-    Observations are grouped by effectiveDateTime (draw date) by the writer.
-
-    Args:
-        resources: List of FHIR Observation resources (category=laboratory).
-
-    Returns:
-        List of lab result dicts with an extra 'draw_date' field for grouping.
-    """
+    """Extract discrete lab results with draw_date for grouping; skip narrative reports."""
     rows = []
     for r in resources:
         if r.get("resourceType") != "Observation":
@@ -262,8 +250,5 @@ def parse_vital_observations(resources: list[dict[str, Any]]) -> list[dict[str, 
 
 
 LAB_COLUMNS = ["Test", "Value", "Unit", "Ref Range", "Flag"]
-LAB_KEY_COLS = ["Test", "draw_date"]
 VITAL_COLUMNS = ["Vital", "Value", "Unit", "Date"]
-VITAL_KEY_COLS = ["Vital", "Date"]
 SOCIAL_COLUMNS = ["Category", "Value"]
-SOCIAL_KEY_COLS = ["Category"]

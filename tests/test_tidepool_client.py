@@ -110,20 +110,6 @@ def test_fetch_uses_correct_endpoint_and_headers(
         url=re.compile(rf"{re.escape(API_BASE)}/data/{USERID}\?.*"),
         status_code=200,
         match_headers={"x-tidepool-session-token": SESSION_TOKEN},
-        json=[{"id": "r1", "type": "cbg", "time": "2026-05-01T12:00:00.000Z"}],
-    )
-    client = TidepoolClient(credentials, api_base=API_BASE, rate_limit_seconds=0)
-    records = list(client.fetch())
-    assert len(records) == 1
-    assert records[0]["id"] == "r1"
-    client.close()
-
-
-def test_fetch_returns_array(httpx_mock, credentials, login_success, logout_success):
-    httpx_mock.add_response(
-        method="GET",
-        url=re.compile(rf"{re.escape(API_BASE)}/data/{USERID}\?.*"),
-        status_code=200,
         json=[
             {"id": "r1", "type": "cbg", "time": "2026-05-01T12:00:00.000Z"},
             {"id": "r2", "type": "bolus", "time": "2026-05-01T12:05:00.000Z"},
@@ -131,7 +117,7 @@ def test_fetch_returns_array(httpx_mock, credentials, login_success, logout_succ
     )
     client = TidepoolClient(credentials, api_base=API_BASE, rate_limit_seconds=0)
     records = list(client.fetch())
-    assert len(records) == 2
+    assert [record["id"] for record in records] == ["r1", "r2"]
     client.close()
 
 
@@ -196,21 +182,6 @@ def test_fetch_401_mid_request_re_authenticates_once(
     client.close()
 
 
-def test_fetch_500_raises_typed_error(
-    httpx_mock, credentials, login_success, logout_success
-):
-    httpx_mock.add_response(
-        method="GET",
-        url=re.compile(rf"{re.escape(API_BASE)}/data/.*"),
-        status_code=500,
-        text="server error",
-    )
-    client = TidepoolClient(credentials, api_base=API_BASE, rate_limit_seconds=0)
-    with pytest.raises(TidepoolFetchError):
-        list(client.fetch())
-    client.close()
-
-
 def test_logout_500_does_not_raise(httpx_mock, credentials, login_success):
     httpx_mock.add_response(
         method="POST",
@@ -269,4 +240,81 @@ def test_basal_duration_normalized_from_ms_to_minutes(
     # Non-basal records pass through untouched
     cgm = [r for r in records if r["type"] == "cbg"][0]
     assert cgm["value"] == 120
+    client.close()
+
+
+def test_login_rejects_changed_account(credentials, login_success, logout_success):
+    credentials.userid = "different-saved-user"
+    client = TidepoolClient(credentials, rate_limit_seconds=0)
+    with pytest.raises(TidepoolAuthError, match="does not match"):
+        client._login()
+    assert client._session_token is None
+    assert client._userid is None
+    client.close()
+
+
+def test_login_accepts_saved_account(credentials, login_success, logout_success):
+    credentials.userid = USERID
+    client = TidepoolClient(credentials, rate_limit_seconds=0)
+    client._login()
+    assert client._userid == USERID
+    client.close()
+
+
+@pytest.mark.parametrize("body", [[], None, {"userid": 123}])
+def test_login_invalid_identity_has_typed_error(httpx_mock, credentials, body):
+    httpx_mock.add_response(method="POST", url=f"{API_BASE}/auth/login",
+                           headers={"x-tidepool-session-token": SESSION_TOKEN}, json=body)
+    client = TidepoolClient(credentials, rate_limit_seconds=0)
+    with pytest.raises(TidepoolAuthError):
+        client._login()
+    client.close()
+
+
+def test_login_error_omits_response_body(httpx_mock, credentials):
+    httpx_mock.add_response(method="POST", url=f"{API_BASE}/auth/login",
+                           status_code=500, text="private-password")
+    client = TidepoolClient(credentials, rate_limit_seconds=0)
+    with pytest.raises(TidepoolAuthError) as error:
+        client._login()
+    assert "private-password" not in str(error.value)
+    client.close()
+
+
+@pytest.mark.parametrize("status, body", [(500, "private-record"), (200, "not JSON"), (200, "[null]")])
+def test_fetch_bad_response_is_typed_and_redacted(
+    httpx_mock, credentials, login_success, logout_success, status, body
+):
+    httpx_mock.add_response(method="GET", url=re.compile(rf"{re.escape(API_BASE)}/data/.*"),
+                           status_code=status, text=body)
+    client = TidepoolClient(credentials, rate_limit_seconds=0)
+    with pytest.raises(TidepoolFetchError) as error:
+        list(client.fetch())
+    assert "private-record" not in str(error.value)
+    client.close()
+
+
+def test_fetch_network_failure_has_typed_error(
+    httpx_mock, credentials, login_success, logout_success
+):
+    httpx_mock.add_exception(httpx.ConnectError("connection failed"), method="GET",
+                             url=re.compile(rf"{re.escape(API_BASE)}/data/.*"))
+    client = TidepoolClient(credentials, rate_limit_seconds=0)
+    with pytest.raises(TidepoolFetchError, match="network error"):
+        list(client.fetch())
+    client.close()
+
+
+def test_fetch_invalid_retry_after_uses_bounded_retry(
+    httpx_mock, credentials, login_success, logout_success, monkeypatch
+):
+    waits = []
+    monkeypatch.setattr("health_sync.sources.tidepool_client.time.sleep", waits.append)
+    for _ in range(3):
+        httpx_mock.add_response(method="GET", url=re.compile(rf"{re.escape(API_BASE)}/data/.*"),
+                               status_code=429, headers={"Retry-After": "invalid"})
+    client = TidepoolClient(credentials, rate_limit_seconds=0)
+    with pytest.raises(TidepoolFetchError, match="3 attempts"):
+        list(client.fetch())
+    assert waits == [2, 4]
     client.close()

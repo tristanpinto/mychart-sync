@@ -4,6 +4,8 @@ import json
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from health_sync.auth.token_store import StoredToken, TokenStore
 from health_sync import cli
 
@@ -192,3 +194,109 @@ def test_providers_remove_deletes_only_assigned_patient_token(
     assert result.exit_code == 0
     assert not (app_config.tokens_dir("person_a") / "mount-sinai_token.json").exists()
     assert (app_config.tokens_dir("person_b") / "mount-sinai_token.json").exists()
+
+
+@pytest.mark.parametrize("contents", ['{"client_id": "private-marker",', '[]', '{"client_id":"private-marker"}'])
+def test_invalid_app_config_is_readable_and_redacted(cli_runner, config_file, contents):
+    config_file.write_text(contents)
+    result = cli_runner.invoke(cli.main, ["persons", "list"])
+    assert result.exit_code == 1
+    assert "Error:" in result.output
+    assert "app.json" in result.output
+    assert "private-marker" not in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("contents", [
+    '{"private-marker":',
+    '{"providers":"private-marker"}',
+    '{"providers":[{"slug":"private-marker"}]}',
+])
+def test_invalid_provider_config_is_readable_and_redacted(cli_runner, config_file, providers_file, contents):
+    providers_file.write_text(contents)
+    result = cli_runner.invoke(cli.main, ["providers", "list"])
+    assert result.exit_code == 1
+    assert "Error:" in result.output
+    assert "providers.json" in result.output
+    assert "private-marker" not in result.output
+
+
+def test_invalid_provider_secret_is_readable_and_redacted(cli_runner, config_file, providers_file):
+    secret = config_file.parent.parent / "secrets/mount_sinai_secrets.json"
+    secret.write_text('{"production":"private-marker"}')
+    result = cli_runner.invoke(cli.main, ["auth", "mount-sinai"])
+    assert result.exit_code == 1
+    assert "Invalid environment settings" in result.output
+    assert "private-marker" not in result.output
+
+
+@pytest.mark.parametrize("slug, expected", [("!!!", "letter or number"), ("mount-sinai", "already registered")])
+def test_provider_add_invalid_or_duplicate_fails(cli_runner, config_file, providers_file, slug, expected):
+    result = cli_runner.invoke(cli.main, [
+        "providers", "add", "--slug", slug, "--name", "Hospital",
+        "--url", "https://hospital.example/FHIR/R4", "--patient", "person_a", "--no-validate",
+    ])
+    assert result.exit_code == 1
+    assert expected in result.output
+
+
+@pytest.mark.parametrize("date, expected", [
+    ("2024-01-01", "2024-01-01T00:00:00+00:00"),
+    ("2024-01-01T08:00:00-05:00", "2024-01-01T13:00:00+00:00"),
+])
+def test_start_preserves_supplied_timezone(cli_runner, config_file, providers_file, monkeypatch, date, expected):
+    providers_file.write_text(json.dumps({"providers": [
+        {"slug": "tidepool", "name": "Tidepool", "kind": "tidepool", "patient": "person_a"},
+    ]}))
+    calls = []
+
+    def fake_sync(*args, **kwargs):
+        calls.append(kwargs["start_override"].isoformat())
+        return {}
+
+    monkeypatch.setattr("health_sync.sync.loop_engine.sync_tidepool_api", fake_sync)
+    result = cli_runner.invoke(cli.main, ["sync", "--provider", "tidepool", "--start", date])
+    assert result.exit_code == 0
+    assert calls == [expected]
+
+
+def test_mixed_sync_uses_one_dispatch_and_preserves_order(
+    cli_runner, config_file, providers_file, monkeypatch,
+):
+    from health_sync.sync import engine
+
+    providers_file.write_text(json.dumps({"providers": [
+        {"slug": "hospital", "name": "Hospital", "patient": "person_a", "fhir_base_url": "https://hospital.example/FHIR/R4"},
+        {"slug": "tidepool", "name": "Tidepool", "kind": "tidepool", "patient": "person_a"},
+    ]}))
+    dispatches = []
+    sources = []
+    original_sync_all = engine.sync_all
+
+    def record_dispatch(config, providers, **kwargs):
+        dispatches.append([provider.slug for provider in providers])
+        return original_sync_all(config, providers, **kwargs)
+
+    def record_source(provider, person, config, **kwargs):
+        sources.append((provider.slug, person, kwargs["start_override"].isoformat()))
+        return {}
+
+    monkeypatch.setattr(engine, "sync_all", record_dispatch)
+    monkeypatch.setattr(engine, "sync_provider", record_source)
+    result = cli_runner.invoke(cli.main, ["sync", "--start", "2024-01-01"])
+    assert result.exit_code == 0
+    assert dispatches == [["tidepool", "hospital"]]
+    assert sources == [
+        ("tidepool", "person_a", "2024-01-01T00:00:00+00:00"),
+        ("hospital", "person_a", "2024-01-01T00:00:00+00:00"),
+    ]
+
+
+def test_help_describes_dry_run_and_current_export_route(cli_runner):
+    sync_help = cli_runner.invoke(cli.main, ["sync", "--help"])
+    assert sync_help.exit_code == 0
+    assert "downloads raw FHIR data" in sync_help.output
+    export_help = cli_runner.invoke(cli.main, ["tidepool", "import-export", "--help"])
+    assert export_help.exit_code == 0
+    assert "app.tidepool.org" in export_help.output
+    assert "Account" not in export_help.output

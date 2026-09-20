@@ -59,4 +59,3 @@ def parse_immunizations(resources: list[dict[str, Any]]) -> list[dict[str, str]]
 
 
 COLUMNS = ["Vaccine", "Date", "Notes"]
-KEY_COLS = ["Vaccine", "Date"]

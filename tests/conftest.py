@@ -189,7 +189,7 @@ def mock_fhir_client(mock_fhir_data: dict[str, list[dict[str, Any]]]) -> type:
             self.close()
 
         def fetch_all(self, since: str | None = None) -> dict[str, list[dict[str, Any]]]:
-            return mock_fhir_data
+            return {**mock_fhir_data, "Patient": [{"resourceType": "Patient", "id": self.kwargs["patient_id"]}]}
 
         def fetch_patient(self) -> dict[str, Any]:
             return mock_fhir_data["Patient"][0]

@@ -2,21 +2,8 @@ from __future__ import annotations
 
 """Tidepool legacy session-token API client.
 
-Implements DiabetesDataSource against api.tidepool.org. The legacy auth flow:
-1. POST /auth/login with HTTP Basic (email:password)
-   → response has x-tidepool-session-token header AND a JSON body containing
-     userid (which is the data-subject userid for personal-use accounts)
-2. GET /data/{userId}?startDate=...&endDate=...&type=... with header
-   x-tidepool-session-token
-3. POST /auth/logout with the session token (polite)
-
-Endpoint verified against Tidepool docs at tidepool.redocly.app — note the
-correct path is `/data/{userId}`, NOT `/data/v1/users/{userid}/data` (the
-original plan had this wrong; the Codex review caught it).
-
-Tidepool deprecated this auth path in December 2022 in favor of Keycloak/OIDC,
-but as of 2026-05 still serves it. xDrip and AndroidAPS in production also use
-it. No published sunset date.
+This deprecated login method requires the user's password. Session tokens
+stay in memory; a saved user ID pins subsequent logins to the same account.
 """
 
 import json
@@ -41,7 +28,7 @@ class TidepoolFetchError(RuntimeError):
 
 
 class TidepoolClient:
-    """Legacy session-token API client. Implements DiabetesDataSource."""
+    """Fetch personal records using a legacy Tidepool session."""
 
     SESSION_TOKEN_HEADER = "x-tidepool-session-token"
 
@@ -68,8 +55,7 @@ class TidepoolClient:
     ) -> Iterator[dict]:
         """Yield records in [start, end). Logs in on first call.
 
-        Phase 2 callers pass a window; for very large windows the caller is
-        responsible for monthly chunking (see loop_engine.sync_tidepool_api).
+        The sync engine splits large windows into monthly requests.
         """
         if self._session_token is None:
             self._login()
@@ -107,11 +93,11 @@ class TidepoolClient:
         if resp.status_code == 401:
             raise TidepoolAuthError(
                 "Tidepool returned 401 — bad email/password, account locked, "
-                "or 2FA enabled. Run: chartstash auth tidepool to re-enter."
+                "or 2FA enabled. Run: mychart-sync auth tidepool to re-enter."
             )
         if resp.status_code >= 400:
             raise TidepoolAuthError(
-                f"Tidepool login failed: HTTP {resp.status_code} {resp.text[:200]}"
+                f"Tidepool login failed: HTTP {resp.status_code}"
             )
 
         token = resp.headers.get(self.SESSION_TOKEN_HEADER)
@@ -125,15 +111,22 @@ class TidepoolClient:
         except (json.JSONDecodeError, ValueError) as e:
             raise TidepoolAuthError(f"Tidepool login: malformed JSON body: {e}") from e
 
-        userid = body.get("userid")
-        if not userid:
+        userid = body.get("userid") if isinstance(body, dict) else None
+        if not isinstance(userid, str) or not userid:
             raise TidepoolAuthError(
-                f"Tidepool login body missing 'userid'. Body keys: {list(body)}"
+                "Tidepool login response missing a valid 'userid'"
             )
 
         self._session_token = token
+        if self.credentials.userid and userid != self.credentials.userid:
+            self._logout()
+            self._session_token = None
+            raise TidepoolAuthError(
+                "Tidepool account does not match the saved user ID. "
+                "Check the account before authenticating again."
+            )
         self._userid = userid
-        logger.info(f"Tidepool authenticated; userid={userid}")
+        logger.info("Tidepool authenticated")
 
     def _logout(self) -> None:
         """POST /auth/logout. Best-effort — failures are logged, not raised."""
@@ -158,7 +151,6 @@ class TidepoolClient:
         """GET /data/{userId} with optional startDate/endDate filters.
 
         Retries on 429 (Retry-After honored) and timeout (exponential backoff).
-        Mirrors the pattern from fhir/client.py:82-111.
         """
         assert self._session_token is not None and self._userid is not None
 
@@ -189,9 +181,16 @@ class TidepoolClient:
                 )
                 time.sleep(wait)
                 continue
+            except httpx.HTTPError as e:
+                raise TidepoolFetchError("Tidepool fetch failed because of a network error") from e
 
             if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", 2 ** (attempt + 1)))
+                if attempt == 2:
+                    break
+                try:
+                    wait = max(0, int(resp.headers.get("Retry-After", 2 ** (attempt + 1))))
+                except ValueError:
+                    wait = 2 ** (attempt + 1)
                 logger.warning(
                     f"Tidepool rate-limited, waiting {wait}s "
                     f"(attempt {attempt + 1}/3)"
@@ -215,13 +214,16 @@ class TidepoolClient:
 
             if resp.status_code >= 400:
                 raise TidepoolFetchError(
-                    f"Tidepool fetch HTTP {resp.status_code}: {resp.text[:200]}"
+                    f"Tidepool fetch HTTP {resp.status_code}"
                 )
 
-            data = resp.json()
-            if not isinstance(data, list):
+            try:
+                data = resp.json()
+            except ValueError as e:
+                raise TidepoolFetchError("Tidepool fetch returned invalid JSON") from e
+            if not isinstance(data, list) or not all(isinstance(r, dict) for r in data):
                 raise TidepoolFetchError(
-                    f"Expected JSON array, got {type(data).__name__}"
+                    "Tidepool fetch must return a JSON array of records"
                 )
             logger.info(
                 f"Fetched {len(data)} records from Tidepool "
@@ -233,16 +235,10 @@ class TidepoolClient:
 
 
 def _normalize_record(record: dict) -> dict:
-    """Normalize an API record to match the export-file unit conventions.
+    """Convert API basal milliseconds to the export/parser's minutes.
 
-    The Tidepool API and the web-UI JSON export return the same record shapes
-    but with different units in a few fields. Most notably, basal.duration is
-    in MILLISECONDS in the API (per Tidepool's data-model docs) but in MINUTES
-    in the export (empirically verified by comparing adjacent records' gaps).
-
-    This function converts the API representation to match the export's units
-    so the downstream parser (parsers/loop.py) sees consistent inputs from
-    both sources. Returns a shallow-copied dict; the original is not mutated.
+    Export units were verified against gaps between adjacent basal records.
+    Copy changed records so the input is not mutated.
     """
     if record.get("type") == "basal" and "duration" in record:
         duration_ms = record["duration"]

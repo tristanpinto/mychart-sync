@@ -17,7 +17,7 @@ def test_token_isolation(app_config, stored_token_factory) -> None:
 
 def test_state_isolation(app_config) -> None:
     person_a_state = SyncState(app_config.sync_state_dir("person_a"))
-    person_a_state.record_sync("mount-sinai", {"Patient": 1}, {"Patient": "abc"})
+    person_a_state.record_sync("mount-sinai", {"Patient": 1})
 
     assert (app_config.sync_state_dir("person_a") / "mount-sinai_state.json").exists()
     assert not (app_config.sync_state_dir("person_b") / "mount-sinai_state.json").exists()
@@ -49,8 +49,7 @@ def test_override_flips_token_and_brain_paths(
         return path.read_text()
 
     monkeypatch.setattr(engine, "FHIRClient", mock_fhir_client)
-    monkeypatch.setattr(engine, "update_clinical_extract", write_marker)
-    monkeypatch.setattr(engine, "update_lab_results", write_marker)
+    monkeypatch.setattr(engine, "write_generated", write_marker)
     monkeypatch.setattr(engine, "download_documents", lambda *args, **kwargs: 0)
 
     engine.sync_provider(

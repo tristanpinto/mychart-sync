@@ -7,13 +7,14 @@ Handles automatic refresh when access tokens expire.
 """
 
 import base64
-import json
 import time
 from pathlib import Path
 from typing import Optional
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
+
+from health_sync.auth.storage import write_private_text
 
 
 class StoredToken(BaseModel):
@@ -40,7 +41,8 @@ class TokenStore:
     def __init__(self, tokens_dir: Path) -> None:
         self.tokens_dir = tokens_dir
         self.person = tokens_dir.name
-        self.tokens_dir.mkdir(parents=True, exist_ok=True)
+        self.tokens_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.tokens_dir.chmod(0o700)
 
     def _token_path(self, slug: str) -> Path:
         return self.tokens_dir / f"{slug}_token.json"
@@ -49,15 +51,19 @@ class TokenStore:
         """Save a token to disk."""
         self._validate_person(token)
         path = self._token_path(token.provider_slug)
-        path.write_text(token.model_dump_json(indent=2))
+        write_private_text(path, token.model_dump_json(indent=2))
 
     def load(self, slug: str) -> Optional[StoredToken]:
         """Load a token from disk. Returns None if not found."""
         path = self._token_path(slug)
         if not path.exists():
             return None
-        data = json.loads(path.read_text())
-        token = StoredToken(**data)
+        try:
+            token = StoredToken.model_validate_json(path.read_text())
+        except ValidationError:
+            raise RuntimeError(
+                f"Invalid token file for '{slug}'. Run: mychart-sync auth {slug}"
+            ) from None
         self._validate_person(token)
         return token
 
@@ -84,23 +90,11 @@ class TokenStore:
     def get_valid_token(
         self, slug: str, client_id: str, client_secret: Optional[str] = None
     ) -> StoredToken:
-        """Get a valid (non-expired) token, refreshing if needed.
-
-        Args:
-            slug: Provider slug.
-            client_id: Epic client ID (needed for refresh).
-            client_secret: If provided, uses confidential client flow for refresh.
-
-        Returns:
-            A StoredToken with a valid access_token.
-
-        Raises:
-            RuntimeError: If no token exists or refresh fails.
-        """
+        """Refresh an expired token; raise RuntimeError if missing or refresh fails."""
         token = self.load(slug)
         if token is None:
             raise RuntimeError(
-                f"No token found for '{slug}'. Run: chartstash auth {slug}"
+                f"No token found for '{slug}'. Run: mychart-sync auth {slug}"
             )
 
         if not token.is_expired():
@@ -109,7 +103,7 @@ class TokenStore:
         if not token.refresh_token:
             raise RuntimeError(
                 f"Token expired for '{slug}' and no refresh token available. "
-                f"Run: chartstash auth {slug}"
+                f"Run: mychart-sync auth {slug}"
             )
 
         return self._refresh(token, client_id, client_secret)
@@ -144,7 +138,7 @@ class TokenStore:
         if resp.status_code == 401 or resp.status_code == 400:
             raise RuntimeError(
                 f"Refresh token expired for '{token.provider_slug}'. "
-                f"Run: chartstash auth {token.provider_slug}"
+                f"Run: mychart-sync auth {token.provider_slug}"
             )
 
         resp.raise_for_status()

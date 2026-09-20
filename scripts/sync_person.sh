@@ -31,7 +31,7 @@ done
 FAILED=()
 for provider in "${PROVIDERS[@]}"; do
     echo "==> Syncing $provider for $PERSON"
-    if .venv/bin/python -m health_sync.cli sync --provider "$provider" --person "$PERSON" --override-patient "$@"; then
+    if .venv/bin/python -m health_sync.cli sync --provider "$provider" --person "$PERSON" "$@"; then
         echo "==> $provider complete"
     else
         status=$?

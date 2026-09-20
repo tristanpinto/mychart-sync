@@ -107,4 +107,3 @@ def parse_conditions(resources: list[dict[str, Any]]) -> list[dict[str, str]]:
 
 
 COLUMNS = ["Diagnosis", "ICD Code", "Onset", "Status"]
-KEY_COLS = ["Diagnosis"]
