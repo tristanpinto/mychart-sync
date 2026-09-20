@@ -20,8 +20,15 @@ Browser control is helpful for Epic's forms, but not required for subsequent syn
 
 ## 1. Install locally
 
-Use a local source checkout, Python 3.10+, and OpenSSL on macOS/Linux. Reuse a working
-environment if present. Otherwise, from the checkout:
+Use Python 3.10+, Git, and OpenSSL on macOS/Linux. Reuse an existing checkout and
+working environment. For a new installation:
+
+```sh
+git clone https://github.com/tristanpinto/mychart-sync.git
+cd mychart-sync
+```
+
+From the checkout, create the Python environment if needed:
 
 ```sh
 umask 077
@@ -153,10 +160,10 @@ need browser auth again. `--full` ignores incremental state. No recurring job is
 
 ```text
 output/
-  clinical_extract.md     conditions, medications, visits, procedures, and more
-  lab_results.md         longitudinal labs with source attribution
-  raw/<hospital>/records.json   retained FHIR records and hospital provenance
-  documents/             PDFs and readable text extracted from clinical documents
+  clinical_extract.md
+  lab_results.md
+  raw/<hospital>/records.json
+  documents/
 ```
 
 JSON keeps the latest downloaded version of each hospital/type/record ID. Missing
