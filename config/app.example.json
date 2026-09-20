@@ -1,0 +1,22 @@
+{
+  "client_id": "YOUR_PRODUCTION_CLIENT_ID",
+  "sandbox_client_id": "YOUR_NON_PRODUCTION_CLIENT_ID",
+  "redirect_uri": "https://localhost:8080/callback",
+  "default_person": "me",
+  "persons": {
+    "me": {
+      "output_dir": "output",
+      "timezone": "America/New_York",
+      "paths": {
+        "clinical_extract": "clinical_extract.md",
+        "health_profile": "health_profile.md",
+        "lab_results": "lab_results.md",
+        "records_dir": "documents",
+        "raw_fhir_dir": "raw",
+        "loop_raw_dir": "loop/raw",
+        "loop_daily_dir": "loop/daily",
+        "loop_telemetry": "loop/loop_telemetry.md"
+      }
+    }
+  }
+}

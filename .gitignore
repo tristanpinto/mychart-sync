@@ -1,0 +1,30 @@
+# Secrets — never commit
+secrets/
+.env
+.env.*
+*.pem
+config/app.json
+config/providers.json
+
+# Cache — regenerated on sync
+cache/
+output/
+.pytest_cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
