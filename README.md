@@ -12,7 +12,7 @@ The agent handles installation, configuration, and your first sync, then saves i
 
 ## The tedious part
 
-For MyChart, you need to create an [Epic developer account](https://fhir.epic.com/), register an app, and enable each hospital. It's laborious—especially choosing among the many API checkboxes. An agent with computer-use capabilities can help work through those selections using the setup guide.
+For MyChart, you need to create an [Epic developer account](https://fhir.epic.com/), register an app, and enable each hospital. It's laborious, especially choosing among the many APIs. An agent with computer-use capabilities can help work through the [registration walkthrough](docs/epic_registration.md).
 
 After registering your app with Epic, each hospital you use needs its own activation first. Registration is a one-time setup. After that, downloads are programmatic, though a hospital may occasionally require you to sign in again.
 

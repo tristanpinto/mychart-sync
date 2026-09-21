@@ -64,12 +64,13 @@ Never share this folder with an analysis agent or include it in public bug repor
 
 ## 2. Register with Epic
 
-Guide the user through [Epic on FHIR](https://fhir.epic.com/), using browser control
-if available. This part can be slow; don't repeatedly recreate an app while waiting.
+Follow the [Epic registration walkthrough](docs/epic_registration.md). Use browser
+control to help fill forms and select APIs. The main steps are:
 
 1. Create a developer account and register a **patient-facing** app using standalone
-   SMART OAuth. Select read-only access, **Enable Auto-download**, **USCDI v3**, and
-   refresh tokens (confidential client). Use the selection rules below for broad record access.
+   SMART OAuth. Choose **Automatic Client Distribution > USCDI v3**, select eligible
+   R4 Read/Search APIs, and check **Is Confidential Client** and **Requires Persistent
+   Access**.
 2. Register exactly `https://localhost:8080/callback`. Put the production and
    non-production client IDs into `config/app.json`. Have the user review the
    API selections, auto-download eligibility, and terms before marking the app
@@ -82,40 +83,11 @@ if available. This part can be slow; don't repeatedly recreate an app while wait
 **Enable each hospital before waiting.** "Ready for Production" alone is not enough
 for this refresh-token setup. Requests can take an hour to appear in the portal;
 after enabling a hospital, distribution can take up to 12 hours before auth works.
-Waiting does not activate a hospital you skipped. Check its status and credentials
-before changing a working configuration. Auto-download also depends on hospital participation.
+Check its status and credentials before changing a working configuration or
+recreating an app. Auto-download also depends on hospital participation.
 See Epic's [distribution and credential instructions](https://fhir.epic.com/Documentation?docId=epicidtypes).
-An [example disclosure](docs/terms.html) is included for review and adaptation.
-
-### Work through the API checkboxes
-
-Use browser control for the repetitive selection work, not just to tell the user
-to click through it. Expand groups and inspect labels and checked states; don't
-rely on remembered screen coordinates or a page-wide "select all".
-
-For users who want all available records, select all **patient-accessible,
-read-only R4 APIs eligible for USCDI v3 auto-download**, including their Read and
-Search variants. Do not limit registration to today's sync implementation. Match
-each choice against Epic's current
-[USCDI auto-distribution appendix](https://fhir.epic.com/Documentation?docId=epicidtypes).
-
-R4 is a FHIR version, not a guarantee that an API is read-only or eligible for
-auto-download. Leave Create/Update/Delete, backend or clinician-only access, and
-older FHIR versions unselected. APIs outside the eligible set can require manual
-hospital distribution; flag those separately rather than silently changing the setup path.
-
-**Search is read-only**; selecting only Read misses calls that list records.
-Epic also splits resources into variants such as clinical notes and generated documents.
-
-Before finalizing, inspect the full selected-API list and any eligibility message;
-summarize the selections for the user without including credentials. If an API's
-eligibility is unclear, check its specification rather than guessing.
-
-Registration, [requested permissions](src/health_sync/auth/smart_auth.py), and
-[implemented downloads](src/health_sync/fhir/client.py) are separate limits.
-Selecting more APIs does not make the tool download everything. Don't silently
-change scopes to fix authorization. This checklist has not been replayed against
-the logged-in form.
+APIs outside automatic-distribution eligibility may need manual hospital
+distribution; flag them rather than silently changing the setup path.
 
 ## 3. Connect each hospital
 
