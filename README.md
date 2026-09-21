@@ -8,7 +8,7 @@ Give a coding agent that can work on your computer this repository and say:
 
 > Follow [SETUP.md](SETUP.md) to set up MyChart Sync and download my health records. Ask which hospitals and sources I use, and walk me through any login or approval you need from me.
 
-The agent handles installation, configuration, and syncing. You can also follow the setup guide yourself.
+The agent handles installation, configuration, and your first sync, then saves instructions for next time. Set it up once; after that, ask your agent to "sync my MyChart records" to update the same local files. You can also follow the setup guide yourself.
 
 ## The tedious part
 
